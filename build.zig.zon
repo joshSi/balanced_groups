@@ -1,0 +1,11 @@
+.{
+    .name = .balanced_groups,
+    .version = "0.1.0",
+    .fingerprint = 0xe512b36224a63042,
+    .minimum_zig_version = "0.16.0",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
