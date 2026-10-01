@@ -129,6 +129,50 @@ pub const BalancedGroupSystem = struct {
         }
     }
 
+    /// Record a round that was formed outside the solver (e.g. groups that met
+    /// before this tool was adopted). Familiarity is updated exactly as if
+    /// `createBalancedGroups` had produced it, and the round joins history so
+    /// it can be undone. Every name must be a current member, no group may be
+    /// empty, and no member may appear twice.
+    pub fn recordManualRound(self: *BalancedGroupSystem, groups: []const []const []const u8) !void {
+        const alloc = self.base.allocator;
+        const n = self.base.memberCount();
+
+        // Validate everything before touching any state.
+        const seen = try alloc.alloc(bool, n);
+        defer alloc.free(seen);
+        @memset(seen, false);
+        for (groups) |group| {
+            if (group.len == 0) return error.EmptyGroup;
+            for (group) |name| {
+                const idx = self.name_to_idx.get(name) orelse return error.MemberNotFound;
+                if (seen[idx]) return error.DuplicateMember;
+                seen[idx] = true;
+            }
+        }
+
+        var round: Round = .empty;
+        errdefer gs_mod.freeRound(alloc, &round);
+        for (groups) |group| {
+            var named: Group = .empty;
+            errdefer gs_mod.freeGroup(alloc, &named);
+            for (group) |name| try named.append(alloc, try alloc.dupe(u8, name));
+            try round.append(alloc, named);
+        }
+        try self.base.recordRound(round);
+
+        // Only after history is committed (the one fallible step) do we touch
+        // the matrix, so a failure above leaves familiarity untouched.
+        for (groups) |group| {
+            for (group, 0..) |name_i, a| {
+                const i = self.name_to_idx.get(name_i).?;
+                for (group[a + 1 ..]) |name_j| {
+                    self.addFam(i, self.name_to_idx.get(name_j).?, 2);
+                }
+            }
+        }
+    }
+
     /// Sum familiarity over all ordered pairs (matches Python's evaluate_group).
     pub fn evaluateGroup(self: *const BalancedGroupSystem, indices: []const usize) u32 {
         var score: u32 = 0;
@@ -398,4 +442,50 @@ test "BalancedGroupSystem undoLastRound tolerates removed members" {
     try bgs.removeMember("Bob");
     try bgs.undoLastRound(); // must not crash or underflow
     for (bgs.fam_matrix.items) |v| try std.testing.expectEqual(@as(u32, 0), v);
+}
+
+test "BalancedGroupSystem recordManualRound updates familiarity and history" {
+    const allocator = std.testing.allocator;
+    var bgs = BalancedGroupSystem.init(allocator);
+    defer bgs.deinit();
+
+    const names = [_][]const u8{ "Alice", "Bob", "Charlie", "David", "Eve" };
+    for (names) |n| try bgs.addMember(n);
+
+    const g1 = [_][]const u8{ "Alice", "Bob", "Charlie" };
+    const g2 = [_][]const u8{"David"}; // Eve absent this round
+    const groups = [_][]const []const u8{ &g1, &g2 };
+    try bgs.recordManualRound(&groups);
+
+    try std.testing.expectEqual(@as(usize, 1), bgs.base.group_history.items.len);
+    try std.testing.expectEqual(@as(u32, 2), bgs.getFam(0, 1));
+    try std.testing.expectEqual(@as(u32, 2), bgs.getFam(0, 2));
+    try std.testing.expectEqual(@as(u32, 2), bgs.getFam(1, 2));
+    try std.testing.expectEqual(@as(u32, 0), bgs.getFam(0, 3));
+    try std.testing.expectEqual(@as(u32, 0), bgs.getFam(3, 4));
+
+    // Undo reverses it completely
+    try bgs.undoLastRound();
+    for (bgs.fam_matrix.items) |v| try std.testing.expectEqual(@as(u32, 0), v);
+    try std.testing.expectEqual(@as(usize, 0), bgs.base.group_history.items.len);
+}
+
+test "BalancedGroupSystem recordManualRound rejects bad input without mutating" {
+    const allocator = std.testing.allocator;
+    var bgs = BalancedGroupSystem.init(allocator);
+    defer bgs.deinit();
+    try bgs.addMember("Alice");
+    try bgs.addMember("Bob");
+
+    const unknown = [_][]const u8{ "Alice", "Zed" };
+    const dup_a = [_][]const u8{"Alice"};
+    const dup_b = [_][]const u8{ "Bob", "Alice" };
+    const empty = [_][]const u8{};
+
+    try std.testing.expectError(error.MemberNotFound, bgs.recordManualRound(&[_][]const []const u8{&unknown}));
+    try std.testing.expectError(error.DuplicateMember, bgs.recordManualRound(&[_][]const []const u8{ &dup_a, &dup_b }));
+    try std.testing.expectError(error.EmptyGroup, bgs.recordManualRound(&[_][]const []const u8{ &dup_a, &empty }));
+
+    try std.testing.expectEqual(@as(usize, 0), bgs.base.group_history.items.len);
+    try std.testing.expectEqual(@as(u32, 0), bgs.getFam(0, 1));
 }

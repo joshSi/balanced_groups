@@ -188,6 +188,8 @@ zig build test
 | `addMember(name)` | Add a member; grows matrix by O(n) |
 | `removeMember(name)` | Remove a member; compacts matrix in O(n) |
 | `createBalancedGroups(count, rand)` | Return a new `Round`; also records in history |
+| `recordManualRound(groups)` | Record externally formed groups (names); updates familiarity and history |
+| `undoLastRound()` | Pop the latest round from history and subtract its familiarity |
 | `getFam(i, j)` | Raw familiarity score between members at indices i and j |
 | `evaluateGroup(indices)` | Sum familiarity over all ordered pairs (Python-compatible) |
 | `printFamiliarity()` | Print the matrix to stderr |
@@ -242,6 +244,7 @@ server refuses to start rather than overwrite it.
 | POST   | `/api/members`         | `{ "name": "Eve" }` | Add a member (409 if it exists) |
 | POST   | `/api/members/remove`  | `{ "name": "Eve" }` | Remove a member and their matrix row/column |
 | POST   | `/api/rounds`          | `{ "group_count": 3 }` | Create a round; returns `{ round, state }` |
+| POST   | `/api/rounds/manual`   | `{ "groups": [["Al","Bo"],["Cy"]], "add_missing": false }` | Record a round formed elsewhere (e.g. before the tool); 422 with `unknown` if names aren't members unless `add_missing` |
 | POST   | `/api/rounds/undo`     |                     | Revert the latest round (familiarity is subtracted) |
 
 All `POST`s require `Authorization: Bearer <BG_API_KEY>` (or `X-Api-Key`)

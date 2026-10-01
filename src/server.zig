@@ -21,6 +21,8 @@
 //!   POST /api/members        {name}    -> add a member
 //!   POST /api/members/remove {name}    -> remove a member
 //!   POST /api/rounds   {group_count}   -> create a round, returns {round, state}
+//!   POST /api/rounds/manual {groups, add_missing?}
+//!                                      -> record groups formed elsewhere
 //!   POST /api/rounds/undo              -> revert the most recent round
 //!
 //! Every POST requires `Authorization: Bearer <BG_API_KEY>` (or `X-Api-Key`).
@@ -326,6 +328,7 @@ fn handle(app: *App, req: *http.Server.Request, arena: Allocator) !void {
     const is_mutation = std.mem.eql(u8, path, "/api/members") or
         std.mem.eql(u8, path, "/api/members/remove") or
         std.mem.eql(u8, path, "/api/rounds") or
+        std.mem.eql(u8, path, "/api/rounds/manual") or
         std.mem.eql(u8, path, "/api/rounds/undo");
     if (!is_mutation) return ctx.respondError(.not_found, "not found");
     if (info.method != .POST) return ctx.respondError(.method_not_allowed, "method not allowed");
@@ -371,6 +374,58 @@ fn handle(app: *App, req: *http.Server.Request, arena: Allocator) !void {
         log.info("created round {d}: {d} groups of {d} members", .{ app.bgs.base.group_history.items.len, body.group_count, n });
         return ctx.respondJson(.created, .{
             .round = RoundView{ .groups = round.items },
+            .state = try stateView(arena, &app.bgs),
+        });
+    }
+
+    if (std.mem.eql(u8, path, "/api/rounds/manual")) {
+        const Body = struct { groups: []const []const []const u8, add_missing: bool = false };
+        const body = parseBody(Body, &ctx) catch |err| return badRequest(&ctx, err);
+        if (body.groups.len == 0) return ctx.respondError(.unprocessable_entity, "provide at least one group");
+
+        // Normalise names, and check for empties/duplicates before mutating.
+        var total: usize = 0;
+        for (body.groups) |g| total += g.len;
+        const clean = try arena.alloc([]const []const u8, body.groups.len);
+        var seen = std.StringHashMap(void).init(arena);
+        var unknown: std.ArrayList([]const u8) = .empty;
+        for (body.groups, 0..) |g, gi| {
+            if (g.len == 0) return ctx.respondError(.unprocessable_entity, "every group needs at least one name");
+            const names = try arena.alloc([]const u8, g.len);
+            for (g, 0..) |raw, ni| {
+                const name = validateName(raw) catch |err| return badRequest(&ctx, err);
+                if (seen.contains(name)) {
+                    const msg = try std.fmt.allocPrint(arena, "{s} appears more than once", .{name});
+                    return ctx.respondError(.unprocessable_entity, msg);
+                }
+                try seen.put(name, {});
+                if (!app.bgs.name_to_idx.contains(name)) try unknown.append(arena, name);
+                names[ni] = name;
+            }
+            clean[gi] = names;
+        }
+        if (unknown.items.len > 0 and !body.add_missing) {
+            return ctx.respondJson(.unprocessable_entity, .{
+                .@"error" = "some names are not members yet",
+                .unknown = unknown.items,
+            });
+        }
+        if (app.bgs.base.memberCount() + unknown.items.len > max_members) {
+            return ctx.respondError(.unprocessable_entity, "too many members");
+        }
+        for (unknown.items) |name| try app.bgs.addMember(name);
+        app.bgs.recordManualRound(clean) catch |err| switch (err) {
+            // All three were ruled out above; anything else is a real failure.
+            error.MemberNotFound, error.DuplicateMember, error.EmptyGroup => unreachable,
+            else => return err,
+        };
+        try app.save();
+        log.info("recorded manual round {d}: {d} groups, {d} members ({d} newly added)", .{
+            app.bgs.base.group_history.items.len, clean.len, total, unknown.items.len,
+        });
+        return ctx.respondJson(.created, .{
+            .round = clean,
+            .added = unknown.items,
             .state = try stateView(arena, &app.bgs),
         });
     }
