@@ -105,6 +105,30 @@ pub const BalancedGroupSystem = struct {
         self.fam_matrix.items[hi * (hi - 1) / 2 + lo] += delta;
     }
 
+    /// Reverse the most recent round: remove it from history and subtract the
+    /// familiarity it added. Pairs involving members that have since been
+    /// removed are skipped. Returns `error.NoRounds` if history is empty.
+    pub fn undoLastRound(self: *BalancedGroupSystem) !void {
+        const alloc = self.base.allocator;
+        if (self.base.group_history.items.len == 0) return error.NoRounds;
+        var round = self.base.group_history.pop().?;
+        defer gs_mod.freeRound(alloc, &round);
+
+        for (round.items) |group| {
+            for (group.items, 0..) |name_i, a| {
+                const i = self.name_to_idx.get(name_i) orelse continue;
+                for (group.items[a + 1 ..]) |name_j| {
+                    const j = self.name_to_idx.get(name_j) orelse continue;
+                    if (i == j) continue;
+                    const lo: usize = @min(i, j);
+                    const hi: usize = @max(i, j);
+                    const slot = &self.fam_matrix.items[hi * (hi - 1) / 2 + lo];
+                    slot.* -|= 2;
+                }
+            }
+        }
+    }
+
     /// Sum familiarity over all ordered pairs (matches Python's evaluate_group).
     pub fn evaluateGroup(self: *const BalancedGroupSystem, indices: []const usize) u32 {
         var score: u32 = 0;
@@ -329,4 +353,49 @@ test "BalancedGroupSystem familiarity accumulates across rounds" {
         }
     }
     try std.testing.expect(any_nonzero);
+}
+
+test "BalancedGroupSystem undoLastRound restores familiarity" {
+    const allocator = std.testing.allocator;
+    var bgs = BalancedGroupSystem.init(allocator);
+    defer bgs.deinit();
+
+    const names = [_][]const u8{ "Alice", "Bob", "Charlie", "David", "Eve", "Frank" };
+    for (names) |n| try bgs.addMember(n);
+
+    var prng = std.Random.DefaultPrng.init(3);
+    var r1 = try bgs.createBalancedGroups(2, prng.random());
+    gs_mod.freeRound(allocator, &r1);
+
+    const before = try allocator.dupe(u32, bgs.fam_matrix.items);
+    defer allocator.free(before);
+
+    var r2 = try bgs.createBalancedGroups(2, prng.random());
+    gs_mod.freeRound(allocator, &r2);
+    try std.testing.expectEqual(@as(usize, 2), bgs.base.group_history.items.len);
+
+    try bgs.undoLastRound();
+    try std.testing.expectEqual(@as(usize, 1), bgs.base.group_history.items.len);
+    try std.testing.expectEqualSlices(u32, before, bgs.fam_matrix.items);
+
+    try bgs.undoLastRound();
+    try std.testing.expectError(error.NoRounds, bgs.undoLastRound());
+    for (bgs.fam_matrix.items) |v| try std.testing.expectEqual(@as(u32, 0), v);
+}
+
+test "BalancedGroupSystem undoLastRound tolerates removed members" {
+    const allocator = std.testing.allocator;
+    var bgs = BalancedGroupSystem.init(allocator);
+    defer bgs.deinit();
+
+    const names = [_][]const u8{ "Alice", "Bob", "Charlie", "David" };
+    for (names) |n| try bgs.addMember(n);
+
+    var prng = std.Random.DefaultPrng.init(5);
+    var r1 = try bgs.createBalancedGroups(2, prng.random());
+    gs_mod.freeRound(allocator, &r1);
+
+    try bgs.removeMember("Bob");
+    try bgs.undoLastRound(); // must not crash or underflow
+    for (bgs.fam_matrix.items) |v| try std.testing.expectEqual(@as(u32, 0), v);
 }

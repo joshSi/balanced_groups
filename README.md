@@ -20,9 +20,10 @@ structures.
 ## Build
 
 ```sh
-zig build          # compile the example binary to zig-out/bin/balanced-groups
+zig build          # compile the example binary and the API server to zig-out/bin/
 zig build run      # compile and run the example
-zig build test     # run the full test suite (17 tests)
+zig build serve    # compile and run the HTTP API server (see below)
+zig build test     # run the full test suite
 zig build bench    # run performance benchmarks (always ReleaseFast)
 ```
 
@@ -204,6 +205,75 @@ Free caller-owned rounds with `freeRound(allocator, &round)`.
 | `addSchedule([]bool)` | Add one availability window |
 | `createBalancedSchedules(group_size)` | Return `[][]usize` (member indices, one group per window) |
 | `freeSchedule(schedule)` | Free the returned schedule |
+
+---
+
+## HTTP API server
+
+`src/server.zig` wraps one `BalancedGroupSystem` in a small JSON API so the
+matrix can live on a server and be driven from a web page
+([joshsi.com/groups.html](https://joshsi.com/groups.html)). It uses only
+`std.http.Server`, has no dependencies, and idles at ~2 MB RSS.
+
+### Persistence
+
+Every mutation serialises the whole system (`src/persist.zig`) and atomically
+replaces the state file (write `state.json.tmp`, fsync, rename). The file is
+the same flat lower-triangle layout as the in-memory matrix:
+
+```json
+{
+  "version": 1,
+  "members": ["Alice", "Bob", "Charlie"],
+  "fam": [2, 0, 2],
+  "history": [[["Alice", "Bob"], ["Charlie"]]]
+}
+```
+
+On start-up the file is loaded back; if it exists but cannot be parsed the
+server refuses to start rather than overwrite it.
+
+### Endpoints
+
+| Method | Path                   | Body                | Description |
+|--------|------------------------|---------------------|-------------|
+| GET    | `/healthz`             |                     | Liveness check |
+| GET    | `/api/state`           |                     | `{ members, familiarity (n×n), history, rounds }` |
+| POST   | `/api/members`         | `{ "name": "Eve" }` | Add a member (409 if it exists) |
+| POST   | `/api/members/remove`  | `{ "name": "Eve" }` | Remove a member and their matrix row/column |
+| POST   | `/api/rounds`          | `{ "group_count": 3 }` | Create a round; returns `{ round, state }` |
+| POST   | `/api/rounds/undo`     |                     | Revert the latest round (familiarity is subtracted) |
+
+All `POST`s require `Authorization: Bearer <BG_API_KEY>` (or `X-Api-Key`)
+and return the full updated `state`. CORS is enabled for the origins in
+`BG_ALLOWED_ORIGINS`, including pre-flight.
+
+### Configuration
+
+| Variable             | Default                              | Purpose |
+|----------------------|--------------------------------------|---------|
+| `BG_HOST`            | `127.0.0.1`                          | Bind address |
+| `BG_PORT`            | `8090`                               | Bind port |
+| `BG_STATE_PATH`      | `state.json`                         | Where the matrix is persisted |
+| `BG_API_KEY`         | *(unset → read-only)*                | Secret required for writes (≥16 chars) |
+| `BG_ALLOWED_ORIGINS` | `https://joshsi.com,https://www.joshsi.com,https://joshsi.github.io` | CORS allow-list |
+
+### Deployment
+
+`scripts/deploy.sh` builds in `ReleaseSafe`, installs the binary to
+`/opt/balanced-groups/`, generates `/etc/balanced-groups.env` with a random
+API key on first run, and installs/restarts the hardened systemd unit in
+`deploy/balanced-groups.service` (`DynamicUser`, state in
+`/var/lib/balanced-groups/`). Re-run it after every change.
+
+```sh
+sudo ./scripts/deploy.sh
+journalctl -u balanced-groups -f --no-pager
+grep BG_API_KEY /etc/balanced-groups.env   # the key to paste into the web page
+```
+
+The service listens on loopback only; a Cloudflare Tunnel public hostname
+(`groups.joshsi.com → http://localhost:8090`) exposes it to the website.
 
 ---
 

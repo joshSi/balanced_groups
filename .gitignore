@@ -1,2 +1,4 @@
 .zig-cache/
 zig-out/
+state.json
+state.json.tmp

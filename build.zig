@@ -28,6 +28,27 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run the example");
     run_step.dependOn(&run_cmd.step);
 
+    // HTTP API server: persists the familiarity matrix to disk and exposes
+    // it as JSON for the website.
+    const server = b.addExecutable(.{
+        .name = "balanced-groups-server",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/server.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "balanced_groups", .module = mod },
+            },
+        }),
+    });
+    b.installArtifact(server);
+
+    const serve_cmd = b.addRunArtifact(server);
+    serve_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| serve_cmd.addArgs(args);
+    const serve_step = b.step("serve", "Run the HTTP API server");
+    serve_step.dependOn(&serve_cmd.step);
+
     const mod_tests = b.addTest(.{
         .root_module = mod,
     });
