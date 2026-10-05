@@ -6,3 +6,7 @@ pub const freeGroup = @import("group_system.zig").freeGroup;
 pub const Group = @import("group_system.zig").Group;
 pub const Round = @import("group_system.zig").Round;
 pub const persist = @import("persist.zig");
+
+test {
+    _ = persist;
+}

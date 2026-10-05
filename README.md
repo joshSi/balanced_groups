@@ -157,7 +157,7 @@ No allocations occur inside the placement loop.
 
 ## Test suite
 
-17 tests covering:
+Tests covering:
 
 - **GroupSystem**: member add/remove, history recording, error handling
 - **BalancedGroupSystem**: partition property (every member appears exactly once
@@ -172,7 +172,7 @@ No allocations occur inside the placement loop.
 
 ```
 zig build test
-# Build Summary: 5/5 steps succeeded; 17/17 tests passed
+# Build Summary: 5/5 steps succeeded; 38/38 tests passed
 ```
 
 ---
@@ -212,25 +212,42 @@ Free caller-owned rounds with `freeRound(allocator, &round)`.
 
 ## HTTP API server
 
-`src/server.zig` wraps one `BalancedGroupSystem` in a small JSON API so the
-matrix can live on a server and be driven from a web page
-([joshsi.com/groups.html](https://joshsi.com/groups.html)). It uses only
+`src/server.zig` wraps several independent `BalancedGroupSystem`s ("group
+systems", each with its own members, familiarity and history) in a small JSON
+API so they can live on a server and be driven from a web page
+([joshsi.com/groups.html](https://joshsi.com/groups.html), which picks a system
+with `?g=<id>`). It uses only
 `std.http.Server`, has no dependencies, and idles at ~2 MB RSS.
 
 ### Persistence
 
-Every mutation serialises the whole system (`src/persist.zig`) and atomically
-replaces the state file (write `state.json.tmp`, fsync, rename). The file is
-the same flat lower-triangle layout as the in-memory matrix:
+Every mutation serialises all systems (`src/persist.zig`) and atomically
+replaces the state file (write `state.json.tmp`, fsync, rename). Each system
+uses the same flat lower-triangle layout as the in-memory matrix:
 
 ```json
 {
-  "version": 1,
-  "members": ["Alice", "Bob", "Charlie"],
-  "fam": [2, 0, 2],
-  "history": [[["Alice", "Bob"], ["Charlie"]]]
+  "version": 3,
+  "systems": [
+    {
+      "id": "main",
+      "name": "Main",
+      "key_hash": null,
+      "created": 0,
+      "members": ["Alice", "Bob", "Charlie"],
+      "fam": [2, 0, 2],
+      "history": [[["Alice", "Bob"], ["Charlie"]]]
+    }
+  ]
 }
 ```
+
+`key_hash` is the SHA-256 (lowercase hex) of the system's passcode, or null
+when only the admin key may edit it. Version 2 files (no `key_hash`,
+`created`) and version 1 files (a single system at the top level, loaded as
+`main`) are still accepted and rewritten as version 3 on the next change, so
+keep a copy if you may roll back to an older binary. With no state file the
+server starts with one empty `main` system.
 
 On start-up the file is loaded back; if it exists but cannot be parsed the
 server refuses to start rather than overwrite it.
@@ -240,16 +257,30 @@ server refuses to start rather than overwrite it.
 | Method | Path                   | Body                | Description |
 |--------|------------------------|---------------------|-------------|
 | GET    | `/healthz`             |                     | Liveness check |
-| GET    | `/api/state`           |                     | `{ members, familiarity (n×n), history, rounds }` |
+| GET    | `/api/systems`          |                     | `{ systems: [{ id, name, members, rounds, locked }] }` (admin key) |
+| POST   | `/api/systems`          | `{ "name": "Chess club", "passcode": "optional" }` | **Open to anyone** (30/hour). Creates an empty system and returns `{ system: {id, name}, passcode }`; the id is the slugged name plus a random suffix (`chess-club-7f3k`) so systems are reachable by link, not by guessing |
+| POST   | `/api/systems/rename`  | `{ "id": "chess-club", "name": "Chess" }` | Rename; the id (and links using it) stay the same |
+| POST   | `/api/systems/delete`  | `{ "id": "chess-club" }` | Delete a system and everything in it (409 for the last one) |
+| POST   | `/api/systems/passcode` | `{ "id": "…", "passcode": "optional" }` | Set a new passcode (generated when omitted); returns it once. Owner or admin |
+| GET    | `/api/state`           |                     | `{ system: {id, name}, members, familiarity (n×n), history, rounds, can_edit, locked }` |
 | POST   | `/api/members`         | `{ "name": "Eve" }` | Add a member (409 if it exists) |
 | POST   | `/api/members/remove`  | `{ "name": "Eve" }` | Remove a member and their matrix row/column |
 | POST   | `/api/rounds`          | `{ "group_count": 3 }` | Create a round; returns `{ round, state }` |
 | POST   | `/api/rounds/manual`   | `{ "groups": [["Al","Bo"],["Cy"]], "add_missing": false }` | Record a round formed elsewhere (e.g. before the tool); 422 with `unknown` if names aren't members unless `add_missing` |
 | POST   | `/api/rounds/undo`     |                     | Revert the latest round (familiarity is subtracted) |
 
-All `POST`s require `Authorization: Bearer <BG_API_KEY>` (or `X-Api-Key`)
-and return the full updated `state`. CORS is enabled for the origins in
-`BG_ALLOWED_ORIGINS`, including pre-flight.
+`/api/state`, `/api/members*` and `/api/rounds*` act on the system given by
+`?system=<id>` (404 if unknown), or on the first system when it is omitted.
+
+Credentials travel as `Authorization: Bearer <token>` (or `X-Api-Key`). A
+system's own passcode edits that system; `BG_API_KEY` is the admin key that
+edits every system, lists them, and is the only way to edit a system without
+a passcode (such as a `main` migrated from an older file; give it one with
+`POST /api/systems/passcode`). Passcodes are stored hashed. `GET /api/state`
+is public and, when a credential is sent, reports in `can_edit` whether it
+may change that system. Member and round endpoints return the full updated
+`state`. CORS is enabled for the origins in `BG_ALLOWED_ORIGINS`, including
+pre-flight.
 
 ### Configuration
 
@@ -258,7 +289,7 @@ and return the full updated `state`. CORS is enabled for the origins in
 | `BG_HOST`            | `127.0.0.1`                          | Bind address |
 | `BG_PORT`            | `8090`                               | Bind port |
 | `BG_STATE_PATH`      | `state.json`                         | Where the matrix is persisted |
-| `BG_API_KEY`         | *(unset → read-only)*                | Secret required for writes (≥16 chars) |
+| `BG_API_KEY`         | *(unset → passcode-only)*            | Admin key (≥16 chars): edits every system, lists them |
 | `BG_ALLOWED_ORIGINS` | `https://joshsi.com,https://www.joshsi.com,https://joshsi.github.io` | CORS allow-list |
 
 ### Deployment
@@ -272,7 +303,7 @@ API key on first run, and installs/restarts the hardened systemd unit in
 ```sh
 sudo ./scripts/deploy.sh
 journalctl -u balanced-groups -f --no-pager
-grep BG_API_KEY /etc/balanced-groups.env   # the key to paste into the web page
+grep BG_API_KEY /etc/balanced-groups.env   # the admin key; it unlocks every system in the web page
 ```
 
 The service listens on loopback only; a Cloudflare Tunnel public hostname

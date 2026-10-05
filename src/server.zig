@@ -1,33 +1,50 @@
 //! HTTP API server for balanced_groups.
 //!
-//! Keeps one `BalancedGroupSystem` in memory, persists it as JSON on every
-//! mutation, and exposes it over a small JSON API consumed by joshsi.com.
+//! Keeps several independent `BalancedGroupSystem`s ("group systems", each
+//! with its own members, familiarity and history) in memory, persists them as
+//! one JSON file on every mutation, and exposes them over a small JSON API
+//! consumed by joshsi.com.
 //!
 //! Configuration (environment variables):
 //!
 //!   BG_HOST             bind address            (default 127.0.0.1)
 //!   BG_PORT             bind port               (default 8090)
 //!   BG_STATE_PATH       JSON state file         (default ./state.json)
-//!   BG_API_KEY          required for all POST requests; if unset, writes are
-//!                       rejected with 503 so the service is read-only
+//!   BG_API_KEY          the admin key: edits every system, lists them all,
+//!                       and is the only way to edit systems without a passcode
 //!   BG_ALLOWED_ORIGINS  comma-separated CORS allow-list
 //!                       (default https://joshsi.com,https://www.joshsi.com,
 //!                                https://joshsi.github.io)
 //!
+//! Anyone can create a group system and gets a passcode for it; that passcode
+//! (or the admin key) is the bearer token for every change to that system.
+//! Ids carry a random suffix so a system is reachable only by its link.
+//!
 //! Endpoints:
 //!
-//!   GET  /healthz                      -> "ok"
-//!   GET  /api/state                    -> { members, familiarity, history }
-//!   POST /api/members        {name}    -> add a member
-//!   POST /api/members/remove {name}    -> remove a member
-//!   POST /api/rounds   {group_count}   -> create a round, returns {round, state}
+//!   GET  /healthz                        -> "ok"
+//!   POST /api/systems  {name, passcode?} -> create a system; returns its id and passcode (open, rate-limited)
+//!   GET  /api/systems                    -> { systems: [{id, name, members, rounds, locked}] }  (admin)
+//!   POST /api/systems/rename   {id, name}            (owner or admin)
+//!   POST /api/systems/delete   {id}                  (owner or admin; not the last one)
+//!   POST /api/systems/passcode {id, passcode?}       -> set or regenerate the passcode (owner or admin)
+//!   GET  /api/state                      -> { system, members, familiarity, history, rounds, can_edit }
+//!   POST /api/members        {name}      -> add a member
+//!   POST /api/members/remove {name}      -> remove a member
+//!   POST /api/rounds   {group_count}     -> create a round, returns {round, state}
 //!   POST /api/rounds/manual {groups, add_missing?}
-//!                                      -> record groups formed elsewhere
-//!   POST /api/rounds/undo              -> revert the most recent round
+//!                                        -> record groups formed elsewhere
+//!   POST /api/rounds/undo                -> revert the most recent round
 //!
-//! Every POST requires `Authorization: Bearer <BG_API_KEY>` (or `X-Api-Key`).
-//! Every mutating response includes the full updated state so the client can
-//! re-render without a second request.
+//! `/api/state`, `/api/members*` and `/api/rounds*` act on the system named by
+//! the `?system=<id>` query parameter, or on the first system when it is
+//! omitted (so clients written before multiple systems keep working).
+//!
+//! Credentials go in `Authorization: Bearer <passcode or admin key>` (or
+//! `X-Api-Key`). `GET /api/state` is public; with a credential it also says
+//! whether that credential may edit (`can_edit`). Every mutating response
+//! includes the full updated state so the client can re-render without a
+//! second request.
 
 const std = @import("std");
 const Io = std.Io;
@@ -43,16 +60,88 @@ const max_body_len = 64 * 1024;
 const max_state_file_len = 64 * 1024 * 1024;
 const max_member_name_len = 64;
 const max_members = 1000;
+const max_systems = 500;
+const max_system_id_len = 40;
+const min_passcode_len = 8;
+const max_passcode_len = 128;
+/// Open creation is rate-limited: at most this many new systems per hour.
+const max_creations_per_hour = 30;
+const passcode_alphabet = "abcdefghjkmnpqrstuvwxyz23456789"; // no 0/o/1/l/i
+const Sha256 = std.crypto.hash.sha2.Sha256;
+
+/// Who is asking, for one system.
+const Role = enum { none, owner, admin };
+
+fn hashPasscode(passcode: []const u8) [Sha256.digest_length * 2]u8 {
+    var digest: [Sha256.digest_length]u8 = undefined;
+    Sha256.hash(passcode, &digest, .{});
+    return std.fmt.bytesToHex(digest, .lower);
+}
+
+fn validatePasscode(raw: []const u8) ![]const u8 {
+    const p = std.mem.trim(u8, raw, " \t\r\n");
+    if (p.len < min_passcode_len) return error.PasscodeTooShort;
+    if (p.len > max_passcode_len) return error.PasscodeTooLong;
+    for (p) |c| if (std.ascii.isControl(c)) return error.InvalidPasscode;
+    return p;
+}
 
 const App = struct {
     gpa: Allocator,
     io: Io,
-    bgs: bg.BalancedGroupSystem,
+    store: persist.Store,
     state_path: []const u8,
     tmp_path: []const u8,
     api_key: ?[]const u8,
     allowed_origins: []const []const u8,
     prng: std.Random.DefaultPrng,
+    /// Unix seconds of recent system creations, for the rate limit.
+    creations: [max_creations_per_hour]i64 = [_]i64{0} ** max_creations_per_hour,
+
+    fn now(self: *const App) i64 {
+        return Io.Clock.Timestamp.now(self.io, .real).raw.toSeconds();
+    }
+
+    /// Record a creation if the hourly budget allows it.
+    fn allowCreation(self: *App) bool {
+        const t = self.now();
+        var oldest: usize = 0;
+        for (self.creations, 0..) |c, i| if (c < self.creations[oldest]) {
+            oldest = i;
+        };
+        if (t - self.creations[oldest] < 3600) return false;
+        self.creations[oldest] = t;
+        return true;
+    }
+
+    /// A fresh passcode like "k7mq-4x2p-9hd3" (about 59 bits), from OS randomness.
+    fn newPasscode(self: *const App, arena: Allocator) ![]const u8 {
+        var raw: [12]u8 = undefined;
+        self.io.random(&raw);
+        var out = try arena.alloc(u8, 14);
+        var j: usize = 0;
+        for (raw, 0..) |b, i| {
+            if (i == 4 or i == 8) {
+                out[j] = '-';
+                j += 1;
+            }
+            out[j] = passcode_alphabet[b % passcode_alphabet.len];
+            j += 1;
+        }
+        return out;
+    }
+
+    fn roleFor(self: *const App, sys: ?*const persist.NamedSystem, presented: ?[]const u8) Role {
+        const p = presented orelse return .none;
+        if (self.authorized(p)) return .admin;
+        const s = sys orelse return .none;
+        const h = s.key_hash orelse return .none;
+        const hex = hashPasscode(p);
+        if (h.len != hex.len) return .none;
+        var diff: u8 = 0;
+        for (h, hex) |a, b| diff |= a ^ b;
+        return if (diff == 0) .owner else .none;
+    }
 
     fn load(self: *App) !void {
         const cwd = Io.Dir.cwd();
@@ -64,23 +153,59 @@ const App = struct {
             else => return err,
         };
         defer self.gpa.free(bytes);
-        var loaded = persist.fromJson(self.gpa, bytes) catch |err| {
+        var loaded = persist.storeFromJson(self.gpa, bytes) catch |err| {
             log.err("state file {s} could not be loaded ({t}); refusing to start so it is not overwritten", .{ self.state_path, err });
             return error.CorruptStateFile;
         };
-        self.bgs.deinit();
-        self.bgs = loaded;
-        loaded = undefined;
-        log.info("loaded {d} members, {d} rounds from {s}", .{
-            self.bgs.base.memberCount(),
-            self.bgs.base.group_history.items.len,
-            self.state_path,
-        });
+        if (loaded.items.len == 0) {
+            loaded.deinit(self.gpa);
+            return;
+        }
+        persist.deinitStore(self.gpa, &self.store);
+        self.store = loaded;
+        for (self.store.items) |*sys| {
+            log.info("loaded system {s}: {d} members, {d} rounds", .{
+                sys.id, sys.bgs.base.memberCount(), sys.bgs.base.group_history.items.len,
+            });
+        }
+    }
+
+    fn find(self: *App, id: []const u8) ?*persist.NamedSystem {
+        for (self.store.items) |*sys| {
+            if (std.mem.eql(u8, sys.id, id)) return sys;
+        }
+        return null;
+    }
+
+    /// Turn a display name into a unique URL-safe id with a random suffix, so a
+    /// system is reachable by its link but not by guessing: "Chess Club!" ->
+    /// "chess-club-7f3k".
+    fn uniqueId(self: *App, arena: Allocator, name: []const u8) ![]const u8 {
+        var base: std.ArrayList(u8) = .empty;
+        for (name) |c| {
+            if (base.items.len >= max_system_id_len) break;
+            if (std.ascii.isAlphanumeric(c)) {
+                try base.append(arena, std.ascii.toLower(c));
+            } else if (base.items.len > 0 and base.items[base.items.len - 1] != '-') {
+                try base.append(arena, '-');
+            }
+        }
+        while (base.items.len > 0 and base.items[base.items.len - 1] == '-') base.items.len -= 1;
+        if (base.items.len == 0) try base.appendSlice(arena, "group");
+
+        while (true) {
+            var raw: [4]u8 = undefined;
+            self.io.random(&raw);
+            var suffix: [4]u8 = undefined;
+            for (raw, 0..) |b, i| suffix[i] = passcode_alphabet[b % passcode_alphabet.len];
+            const candidate = try std.fmt.allocPrint(arena, "{s}-{s}", .{ base.items, suffix });
+            if (self.find(candidate) == null) return candidate;
+        }
     }
 
     /// Atomically persist: write to a temp file, fsync, rename over the target.
     fn save(self: *App) !void {
-        const json = try persist.toJson(self.gpa, &self.bgs);
+        const json = try persist.storeToJson(self.gpa, self.store.items);
         defer self.gpa.free(json);
 
         const cwd = Io.Dir.cwd();
@@ -115,6 +240,8 @@ const App = struct {
 const RequestInfo = struct {
     method: http.Method,
     path: []const u8,
+    /// Value of the `system` query parameter, if present.
+    system: ?[]const u8,
     origin: ?[]const u8,
     api_key: ?[]const u8,
 };
@@ -163,10 +290,15 @@ const Ctx = struct {
 /// Wire shape of GET /api/state. Slices alias the live system; serialise
 /// before mutating again.
 const StateView = struct {
+    system: SystemRef,
     members: []const []const u8,
     familiarity: []const []const u32,
     history: HistoryView,
     rounds: usize,
+    /// May the credential sent with this request change the system?
+    can_edit: bool,
+    /// Does the system have its own passcode (false: admin key only)?
+    locked: bool,
 
     const HistoryView = struct {
         rounds: []const bg.Round,
@@ -186,7 +318,30 @@ const StateView = struct {
     };
 };
 
-fn stateView(arena: Allocator, bgs: *const bg.BalancedGroupSystem) !StateView {
+const SystemRef = struct { id: []const u8, name: []const u8 };
+
+const SystemSummary = struct {
+    id: []const u8,
+    name: []const u8,
+    members: usize,
+    rounds: usize,
+    locked: bool,
+};
+
+fn systemsView(arena: Allocator, app: *const App) ![]const SystemSummary {
+    const out = try arena.alloc(SystemSummary, app.store.items.len);
+    for (app.store.items, out) |*sys, *o| o.* = .{
+        .id = sys.id,
+        .name = sys.name,
+        .members = sys.bgs.base.memberCount(),
+        .rounds = sys.bgs.base.group_history.items.len,
+        .locked = sys.key_hash != null,
+    };
+    return out;
+}
+
+fn stateView(arena: Allocator, sys: *const persist.NamedSystem, role: Role) !StateView {
+    const bgs = &sys.bgs;
     const n = bgs.base.memberCount();
     const rows = try arena.alloc([]const u32, n);
     for (rows, 0..) |*row, i| {
@@ -195,10 +350,13 @@ fn stateView(arena: Allocator, bgs: *const bg.BalancedGroupSystem) !StateView {
         row.* = r;
     }
     return .{
+        .system = .{ .id = sys.id, .name = sys.name },
         .members = @ptrCast(bgs.base.members.items),
         .familiarity = rows,
         .history = .{ .rounds = bgs.base.group_history.items },
         .rounds = bgs.base.group_history.items.len,
+        .can_edit = role != .none,
+        .locked = sys.key_hash != null,
     };
 }
 
@@ -219,11 +377,22 @@ fn readHeaders(req: *const http.Server.Request, arena: Allocator) !RequestInfo {
     var info: RequestInfo = .{
         .method = req.head.method,
         .path = req.head.target,
+        .system = null,
         .origin = null,
         .api_key = null,
     };
-    // Drop query string.
-    if (std.mem.indexOfScalar(u8, info.path, '?')) |q| info.path = info.path[0..q];
+    // Split off the query string; the only parameter we read is `system`.
+    if (std.mem.indexOfScalar(u8, info.path, '?')) |q| {
+        var params = std.mem.splitScalar(u8, info.path[q + 1 ..], '&');
+        while (params.next()) |param| {
+            const prefix = "system=";
+            if (std.mem.startsWith(u8, param, prefix)) {
+                // Ids are [a-z0-9-], so no percent-decoding is needed.
+                info.system = try arena.dupe(u8, param[prefix.len..]);
+            }
+        }
+        info.path = info.path[0..q];
+    }
     info.path = try arena.dupe(u8, info.path);
 
     var it = req.iterateHeaders();
@@ -282,6 +451,9 @@ fn handle(app: *App, req: *http.Server.Request, arena: Allocator) !void {
     // it tries to discard the body on a keep-alive connection. Treat such a
     // request as body-less and close the connection after responding.
     if (bodyLengthUnknown(req)) req.head.keep_alive = false;
+    // One connection is served at a time, so an idle keep-alive connection
+    // would stall every other client until it closes. Answer and hang up.
+    req.head.keep_alive = false;
 
     const info = try readHeaders(req, arena);
     var ctx: Ctx = .{
@@ -321,60 +493,141 @@ fn handle(app: *App, req: *http.Server.Request, arena: Allocator) !void {
 
     if (std.mem.eql(u8, path, "/api/state")) {
         if (!is_get) return ctx.respondError(.method_not_allowed, "method not allowed");
-        return ctx.respondJson(.ok, try stateView(arena, &app.bgs));
+        const sys = selectSystem(app, info) orelse return ctx.respondError(.not_found, "no such group system");
+        return ctx.respondJson(.ok, try stateView(arena, sys, app.roleFor(sys, info.api_key)));
     }
 
-    // Everything below mutates state.
-    const is_mutation = std.mem.eql(u8, path, "/api/members") or
+    // ── open: create a system ────────────────────────────────────────────
+    if (std.mem.eql(u8, path, "/api/systems") and info.method == .POST) {
+        const Body = struct { name: []const u8, passcode: ?[]const u8 = null };
+        const body = parseBody(Body, &ctx) catch |err| return badRequest(&ctx, err);
+        const name = validateName(body.name) catch |err| return badRequest(&ctx, err);
+        var passcode: []const u8 = undefined;
+        if (body.passcode) |p| {
+            passcode = validatePasscode(p) catch |err| return badRequest(&ctx, err);
+        } else passcode = try app.newPasscode(arena);
+        if (app.store.items.len >= max_systems) return ctx.respondError(.unprocessable_entity, "too many group systems");
+        const is_admin = app.authorized(info.api_key);
+        if (!is_admin and !app.allowCreation()) return ctx.respondError(.too_many_requests, "too many new group systems right now; try again later");
+        const id = try app.uniqueId(arena, name);
+        const hash = hashPasscode(passcode);
+        try persist.appendSystem(app.gpa, &app.store, id, name, &hash, app.now(), bg.BalancedGroupSystem.init(app.gpa));
+        try app.save();
+        log.info("created system {s} ({s}){s}", .{ id, name, if (is_admin) " [admin]" else "" });
+        return ctx.respondJson(.created, .{
+            .system = SystemRef{ .id = id, .name = name },
+            .passcode = passcode,
+            .systems = if (is_admin) try systemsView(arena, app) else null,
+        });
+    }
+
+    // ── admin: list everything ───────────────────────────────────────────
+    if (std.mem.eql(u8, path, "/api/systems")) {
+        if (!is_get) return ctx.respondError(.method_not_allowed, "method not allowed");
+        if (app.api_key == null) return ctx.respondError(.service_unavailable, "BG_API_KEY not configured");
+        if (!app.authorized(info.api_key)) return ctx.respondError(.unauthorized, "invalid or missing API key");
+        return ctx.respondJson(.ok, .{ .systems = try systemsView(arena, app) });
+    }
+
+    // ── everything else mutates one system: owner passcode or admin key ──
+    const is_system_op = std.mem.eql(u8, path, "/api/systems/rename") or
+        std.mem.eql(u8, path, "/api/systems/delete") or
+        std.mem.eql(u8, path, "/api/systems/passcode");
+    const is_mutation = is_system_op or
+        std.mem.eql(u8, path, "/api/members") or
         std.mem.eql(u8, path, "/api/members/remove") or
         std.mem.eql(u8, path, "/api/rounds") or
         std.mem.eql(u8, path, "/api/rounds/manual") or
         std.mem.eql(u8, path, "/api/rounds/undo");
     if (!is_mutation) return ctx.respondError(.not_found, "not found");
     if (info.method != .POST) return ctx.respondError(.method_not_allowed, "method not allowed");
-    if (app.api_key == null) return ctx.respondError(.service_unavailable, "server is read-only: BG_API_KEY not configured");
-    if (!app.authorized(info.api_key)) return ctx.respondError(.unauthorized, "invalid or missing API key");
+
+    if (is_system_op) {
+        const Body = struct { id: []const u8, name: ?[]const u8 = null, passcode: ?[]const u8 = null };
+        const body = parseBody(Body, &ctx) catch |err| return badRequest(&ctx, err);
+        const sys = app.find(body.id) orelse return ctx.respondError(.not_found, "no such group system");
+        const role = app.roleFor(sys, info.api_key);
+        if (role == .none) return ctx.respondError(.unauthorized, if (sys.key_hash == null) "this group system can only be edited with the admin key" else "invalid or missing passcode");
+
+        if (std.mem.eql(u8, path, "/api/systems/rename")) {
+            const name = validateName(body.name orelse "") catch |err| return badRequest(&ctx, err);
+            const new_name = try app.gpa.dupe(u8, name);
+            app.gpa.free(sys.name);
+            sys.name = new_name;
+            try app.save();
+            log.info("renamed system {s} to {s}", .{ sys.id, name });
+            return ctx.respondJson(.ok, .{
+                .system = SystemRef{ .id = sys.id, .name = sys.name },
+                .systems = if (role == .admin) try systemsView(arena, app) else null,
+            });
+        }
+        if (std.mem.eql(u8, path, "/api/systems/passcode")) {
+            var passcode: []const u8 = undefined;
+            if (body.passcode) |p| {
+                passcode = validatePasscode(p) catch |err| return badRequest(&ctx, err);
+            } else passcode = try app.newPasscode(arena);
+            const hash = hashPasscode(passcode);
+            try sys.setKeyHash(app.gpa, &hash);
+            try app.save();
+            log.info("new passcode for system {s}", .{sys.id});
+            return ctx.respondJson(.ok, .{ .system = SystemRef{ .id = sys.id, .name = sys.name }, .passcode = passcode });
+        }
+        // delete
+        if (app.store.items.len == 1) return ctx.respondError(.conflict, "cannot delete the only group system");
+        const idx = (@intFromPtr(sys) - @intFromPtr(app.store.items.ptr)) / @sizeOf(persist.NamedSystem);
+        var removed = app.store.orderedRemove(idx);
+        log.info("deleted system {s} ({d} members, {d} rounds)", .{
+            removed.id, removed.bgs.base.memberCount(), removed.bgs.base.group_history.items.len,
+        });
+        removed.deinit(app.gpa);
+        try app.save();
+        return ctx.respondJson(.ok, .{ .systems = if (role == .admin) try systemsView(arena, app) else null });
+    }
+
+    const sys = selectSystem(app, info) orelse return ctx.respondError(.not_found, "no such group system");
+    const role = app.roleFor(sys, info.api_key);
+    if (role == .none) return ctx.respondError(.unauthorized, if (sys.key_hash == null) "this group system can only be edited with the admin key" else "invalid or missing passcode");
 
     if (std.mem.eql(u8, path, "/api/members")) {
         const Body = struct { name: []const u8 };
         const body = parseBody(Body, &ctx) catch |err| return badRequest(&ctx, err);
         const name = validateName(body.name) catch |err| return badRequest(&ctx, err);
-        if (app.bgs.name_to_idx.contains(name)) return ctx.respondError(.conflict, "member already exists");
-        if (app.bgs.base.memberCount() >= max_members) return ctx.respondError(.unprocessable_entity, "too many members");
-        try app.bgs.addMember(name);
+        if (sys.bgs.name_to_idx.contains(name)) return ctx.respondError(.conflict, "member already exists");
+        if (sys.bgs.base.memberCount() >= max_members) return ctx.respondError(.unprocessable_entity, "too many members");
+        try sys.bgs.addMember(name);
         try app.save();
         log.info("added member {s}", .{name});
-        return ctx.respondJson(.created, .{ .state = try stateView(arena, &app.bgs) });
+        return ctx.respondJson(.created, .{ .state = try stateView(arena, sys, role) });
     }
 
     if (std.mem.eql(u8, path, "/api/members/remove")) {
         const Body = struct { name: []const u8 };
         const body = parseBody(Body, &ctx) catch |err| return badRequest(&ctx, err);
         const name = validateName(body.name) catch |err| return badRequest(&ctx, err);
-        app.bgs.removeMember(name) catch |err| switch (err) {
+        sys.bgs.removeMember(name) catch |err| switch (err) {
             error.MemberNotFound => return ctx.respondError(.not_found, "member not found"),
             else => return err,
         };
         try app.save();
         log.info("removed member {s}", .{name});
-        return ctx.respondJson(.ok, .{ .state = try stateView(arena, &app.bgs) });
+        return ctx.respondJson(.ok, .{ .state = try stateView(arena, sys, role) });
     }
 
     if (std.mem.eql(u8, path, "/api/rounds")) {
         const Body = struct { group_count: usize };
         const body = parseBody(Body, &ctx) catch |err| return badRequest(&ctx, err);
-        const n = app.bgs.base.memberCount();
+        const n = sys.bgs.base.memberCount();
         if (n == 0) return ctx.respondError(.unprocessable_entity, "add some members first");
         if (body.group_count == 0 or body.group_count > n) {
             return ctx.respondError(.unprocessable_entity, "group_count must be between 1 and the number of members");
         }
-        var round = try app.bgs.createBalancedGroups(body.group_count, app.prng.random());
+        var round = try sys.bgs.createBalancedGroups(body.group_count, app.prng.random());
         defer bg.freeRound(app.gpa, &round);
         try app.save();
-        log.info("created round {d}: {d} groups of {d} members", .{ app.bgs.base.group_history.items.len, body.group_count, n });
+        log.info("created round {d}: {d} groups of {d} members", .{ sys.bgs.base.group_history.items.len, body.group_count, n });
         return ctx.respondJson(.created, .{
             .round = RoundView{ .groups = round.items },
-            .state = try stateView(arena, &app.bgs),
+            .state = try stateView(arena, sys, role),
         });
     }
 
@@ -399,7 +652,7 @@ fn handle(app: *App, req: *http.Server.Request, arena: Allocator) !void {
                     return ctx.respondError(.unprocessable_entity, msg);
                 }
                 try seen.put(name, {});
-                if (!app.bgs.name_to_idx.contains(name)) try unknown.append(arena, name);
+                if (!sys.bgs.name_to_idx.contains(name)) try unknown.append(arena, name);
                 names[ni] = name;
             }
             clean[gi] = names;
@@ -410,38 +663,45 @@ fn handle(app: *App, req: *http.Server.Request, arena: Allocator) !void {
                 .unknown = unknown.items,
             });
         }
-        if (app.bgs.base.memberCount() + unknown.items.len > max_members) {
+        if (sys.bgs.base.memberCount() + unknown.items.len > max_members) {
             return ctx.respondError(.unprocessable_entity, "too many members");
         }
-        for (unknown.items) |name| try app.bgs.addMember(name);
-        app.bgs.recordManualRound(clean) catch |err| switch (err) {
+        for (unknown.items) |name| try sys.bgs.addMember(name);
+        sys.bgs.recordManualRound(clean) catch |err| switch (err) {
             // All three were ruled out above; anything else is a real failure.
             error.MemberNotFound, error.DuplicateMember, error.EmptyGroup => unreachable,
             else => return err,
         };
         try app.save();
         log.info("recorded manual round {d}: {d} groups, {d} members ({d} newly added)", .{
-            app.bgs.base.group_history.items.len, clean.len, total, unknown.items.len,
+            sys.bgs.base.group_history.items.len, clean.len, total, unknown.items.len,
         });
         return ctx.respondJson(.created, .{
             .round = clean,
             .added = unknown.items,
-            .state = try stateView(arena, &app.bgs),
+            .state = try stateView(arena, sys, role),
         });
     }
 
     if (std.mem.eql(u8, path, "/api/rounds/undo")) {
         // Consume (and ignore) any body so the connection stays in sync.
         _ = readBody(&ctx) catch {};
-        app.bgs.undoLastRound() catch |err| switch (err) {
+        sys.bgs.undoLastRound() catch |err| switch (err) {
             error.NoRounds => return ctx.respondError(.conflict, "no rounds to undo"),
         };
         try app.save();
-        log.info("undid last round; {d} rounds remain", .{app.bgs.base.group_history.items.len});
-        return ctx.respondJson(.ok, .{ .state = try stateView(arena, &app.bgs) });
+        log.info("undid last round; {d} rounds remain", .{sys.bgs.base.group_history.items.len});
+        return ctx.respondJson(.ok, .{ .state = try stateView(arena, sys, role) });
     }
 
     unreachable;
+}
+
+/// The system named by `?system=`, or the first one when it is omitted.
+fn selectSystem(app: *App, info: RequestInfo) ?*persist.NamedSystem {
+    if (info.system) |id| return app.find(id);
+    if (app.store.items.len == 0) return null;
+    return &app.store.items[0];
 }
 
 fn badRequest(ctx: *Ctx, err: anyerror) !void {
@@ -452,6 +712,9 @@ fn badRequest(ctx: *Ctx, err: anyerror) !void {
         error.EmptyName => "name must not be empty",
         error.NameTooLong => "name is too long (max 64 bytes)",
         error.InvalidName => "name contains invalid characters",
+        error.PasscodeTooShort => "passcode must be at least 8 characters",
+        error.PasscodeTooLong => "passcode is too long (max 128 bytes)",
+        error.InvalidPasscode => "passcode contains invalid characters",
         else => return err,
     };
     try ctx.respondError(.bad_request, msg);
@@ -523,7 +786,7 @@ pub fn main(init: std.process.Init) !void {
         log.err("BG_API_KEY must be at least 16 characters; refusing to start", .{});
         return error.InvalidConfig;
     }
-    if (api_key == null) log.warn("BG_API_KEY is not set: the API is read-only", .{});
+    if (api_key == null) log.warn("BG_API_KEY is not set: systems without a passcode cannot be edited and /api/systems is unavailable", .{});
 
     var seed: u64 = undefined;
     io.random(std.mem.asBytes(&seed));
@@ -531,18 +794,21 @@ pub fn main(init: std.process.Init) !void {
     var app: App = .{
         .gpa = gpa,
         .io = io,
-        .bgs = bg.BalancedGroupSystem.init(gpa),
+        .store = .empty,
         .state_path = state_path,
         .tmp_path = try std.fmt.allocPrint(gpa, "{s}.tmp", .{state_path}),
         .api_key = api_key,
         .allowed_origins = try splitOrigins(gpa, env.get("BG_ALLOWED_ORIGINS") orelse default_origins),
         .prng = std.Random.DefaultPrng.init(seed),
     };
-    defer app.bgs.deinit();
+    defer persist.deinitStore(gpa, &app.store);
     defer gpa.free(app.tmp_path);
     defer gpa.free(app.allowed_origins);
 
     try app.load();
+    if (app.store.items.len == 0) {
+        try persist.appendSystem(gpa, &app.store, persist.legacy_system_id, persist.legacy_system_name, null, 0, bg.BalancedGroupSystem.init(gpa));
+    }
 
     const addr = Io.net.IpAddress.parse(host, port) catch {
         log.err("BG_HOST is not a valid IP address: {s}", .{host});
