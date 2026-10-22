@@ -28,13 +28,25 @@
 //!   POST /api/systems/rename   {id, name}            (owner or admin)
 //!   POST /api/systems/delete   {id}                  (owner or admin; not the last one)
 //!   POST /api/systems/passcode {id, passcode?}       -> set or regenerate the passcode (owner or admin)
-//!   GET  /api/state                      -> { system, members, familiarity, history, rounds, can_edit }
+//!   GET  /api/state                      -> { system, members, familiarity, history, rounds, can_edit,
+//!                                             slots, slot_weight, slot_visits }
 //!   POST /api/members        {name}      -> add a member
 //!   POST /api/members/remove {name}      -> remove a member
+//!   POST /api/slots {slots, slot_weight?} -> name the group ids (permutation mode), or
+//!                                           `slots: null` to go back to classic mode
 //!   POST /api/rounds   {group_count}     -> create a round, returns {round, state}
 //!   POST /api/rounds/manual {groups, add_missing?}
 //!                                        -> record groups formed elsewhere
 //!   POST /api/rounds/undo                -> revert the most recent round
+//!
+//! Permutation mode: when a system has `slots` (names such as "Patio",
+//! "Kitchen"), group i of every round is at `slots[i]`, `group_count` is
+//! optional (it is `slots.length`), and rounds also rotate members through
+//! the ids (`createSlottedGroups`, weighted by `slot_weight`). Ids are
+//! positional: renaming keeps an id's history, reordering does not move it.
+//! `slot_visits[m][i]` counts past rounds member m spent at id i. Manual
+//! rounds are positional too, so an unused id is an empty group `[]`.
+//! In classic mode `slots` and `slot_visits` are null.
 //!
 //! `/api/state`, `/api/members*` and `/api/rounds*` act on the system named by
 //! the `?system=<id>` query parameter, or on the first system when it is
@@ -61,6 +73,8 @@ const max_state_file_len = 64 * 1024 * 1024;
 const max_member_name_len = 64;
 const max_members = 1000;
 const max_systems = 500;
+const max_slots = 100;
+const max_slot_weight = 100;
 const max_system_id_len = 40;
 const min_passcode_len = 8;
 const max_passcode_len = 128;
@@ -114,12 +128,17 @@ const App = struct {
         return true;
     }
 
-    /// A fresh passcode like "k7mq-4x2p-9hd3" (about 59 bits), from OS randomness.
-    fn newPasscode(self: *const App, arena: Allocator) ![]const u8 {
+    /// A fresh passcode like "chess-club-7f3k-k7mq-4x2p-9hd3": the system id
+    /// (so the passcode itself says which link it opens) followed by about 59
+    /// bits from OS randomness. The page recovers the id by dropping the last
+    /// 15 bytes ("-xxxx-xxxx-xxxx").
+    fn newPasscode(self: *const App, arena: Allocator, id: []const u8) ![]const u8 {
         var raw: [12]u8 = undefined;
         self.io.random(&raw);
-        var out = try arena.alloc(u8, 14);
-        var j: usize = 0;
+        var out = try arena.alloc(u8, id.len + 1 + 14);
+        @memcpy(out[0..id.len], id);
+        out[id.len] = '-';
+        var j: usize = id.len + 1;
         for (raw, 0..) |b, i| {
             if (i == 4 or i == 8) {
                 out[j] = '-';
@@ -299,6 +318,11 @@ const StateView = struct {
     can_edit: bool,
     /// Does the system have its own passcode (false: admin key only)?
     locked: bool,
+    /// Permutation mode: the group-id names, in order; null in classic mode.
+    slots: ?[]const []const u8,
+    slot_weight: u32,
+    /// Permutation mode: `slot_visits[m][i]` = past rounds member m spent at id i.
+    slot_visits: ?[]const []const u32,
 
     const HistoryView = struct {
         rounds: []const bg.Round,
@@ -349,6 +373,13 @@ fn stateView(arena: Allocator, sys: *const persist.NamedSystem, role: Role) !Sta
         for (r, 0..) |*cell, j| cell.* = bgs.getFam(i, j);
         row.* = r;
     }
+    var visits: ?[]const []const u32 = null;
+    if (sys.slots) |slots| {
+        const flat = try bgs.slotCounts(arena, slots.len);
+        const per_member = try arena.alloc([]const u32, n);
+        for (per_member, 0..) |*row, m| row.* = flat[m * slots.len ..][0..slots.len];
+        visits = per_member;
+    }
     return .{
         .system = .{ .id = sys.id, .name = sys.name },
         .members = @ptrCast(bgs.base.members.items),
@@ -357,6 +388,9 @@ fn stateView(arena: Allocator, sys: *const persist.NamedSystem, role: Role) !Sta
         .rounds = bgs.base.group_history.items.len,
         .can_edit = role != .none,
         .locked = sys.key_hash != null,
+        .slots = if (sys.slots) |s| @ptrCast(s) else null,
+        .slot_weight = sys.slot_weight,
+        .slot_visits = visits,
     };
 }
 
@@ -502,14 +536,15 @@ fn handle(app: *App, req: *http.Server.Request, arena: Allocator) !void {
         const Body = struct { name: []const u8, passcode: ?[]const u8 = null };
         const body = parseBody(Body, &ctx) catch |err| return badRequest(&ctx, err);
         const name = validateName(body.name) catch |err| return badRequest(&ctx, err);
-        var passcode: []const u8 = undefined;
-        if (body.passcode) |p| {
-            passcode = validatePasscode(p) catch |err| return badRequest(&ctx, err);
-        } else passcode = try app.newPasscode(arena);
+        const custom_passcode: ?[]const u8 = if (body.passcode) |p|
+            validatePasscode(p) catch |err| return badRequest(&ctx, err)
+        else
+            null;
         if (app.store.items.len >= max_systems) return ctx.respondError(.unprocessable_entity, "too many group systems");
         const is_admin = app.authorized(info.api_key);
         if (!is_admin and !app.allowCreation()) return ctx.respondError(.too_many_requests, "too many new group systems right now; try again later");
         const id = try app.uniqueId(arena, name);
+        const passcode = custom_passcode orelse try app.newPasscode(arena, id);
         const hash = hashPasscode(passcode);
         try persist.appendSystem(app.gpa, &app.store, id, name, &hash, app.now(), bg.BalancedGroupSystem.init(app.gpa));
         try app.save();
@@ -536,6 +571,7 @@ fn handle(app: *App, req: *http.Server.Request, arena: Allocator) !void {
     const is_mutation = is_system_op or
         std.mem.eql(u8, path, "/api/members") or
         std.mem.eql(u8, path, "/api/members/remove") or
+        std.mem.eql(u8, path, "/api/slots") or
         std.mem.eql(u8, path, "/api/rounds") or
         std.mem.eql(u8, path, "/api/rounds/manual") or
         std.mem.eql(u8, path, "/api/rounds/undo");
@@ -562,10 +598,10 @@ fn handle(app: *App, req: *http.Server.Request, arena: Allocator) !void {
             });
         }
         if (std.mem.eql(u8, path, "/api/systems/passcode")) {
-            var passcode: []const u8 = undefined;
-            if (body.passcode) |p| {
-                passcode = validatePasscode(p) catch |err| return badRequest(&ctx, err);
-            } else passcode = try app.newPasscode(arena);
+            const passcode = if (body.passcode) |p|
+                validatePasscode(p) catch |err| return badRequest(&ctx, err)
+            else
+                try app.newPasscode(arena, sys.id);
             const hash = hashPasscode(passcode);
             try sys.setKeyHash(app.gpa, &hash);
             try app.save();
@@ -613,18 +649,59 @@ fn handle(app: *App, req: *http.Server.Request, arena: Allocator) !void {
         return ctx.respondJson(.ok, .{ .state = try stateView(arena, sys, role) });
     }
 
-    if (std.mem.eql(u8, path, "/api/rounds")) {
-        const Body = struct { group_count: usize };
+    if (std.mem.eql(u8, path, "/api/slots")) {
+        const Body = struct { slots: ?[]const []const u8, slot_weight: ?u32 = null };
         const body = parseBody(Body, &ctx) catch |err| return badRequest(&ctx, err);
+        var clean: ?[]const []const u8 = null;
+        if (body.slots) |raw| {
+            if (raw.len == 0) return ctx.respondError(.unprocessable_entity, "name at least one group, or send slots: null for classic mode");
+            if (raw.len > max_slots) return ctx.respondError(.unprocessable_entity, "too many groups (max 100)");
+            const names = try arena.alloc([]const u8, raw.len);
+            for (raw, 0..) |r, i| {
+                names[i] = validateName(r) catch |err| return badRequest(&ctx, err);
+                for (names[0..i]) |prev| if (std.mem.eql(u8, prev, names[i])) {
+                    const msg = try std.fmt.allocPrint(arena, "{s} appears more than once", .{names[i]});
+                    return ctx.respondError(.unprocessable_entity, msg);
+                };
+            }
+            clean = names;
+        }
+        if (body.slot_weight) |w| if (w > max_slot_weight) return ctx.respondError(.unprocessable_entity, "slot_weight must be between 0 and 100");
+        try sys.setSlots(app.gpa, clean);
+        if (body.slot_weight) |w| sys.slot_weight = w;
+        try app.save();
+        if (clean) |names| {
+            log.info("system {s}: {d} named groups, weight {d}", .{ sys.id, names.len, sys.slot_weight });
+        } else log.info("system {s}: classic mode", .{sys.id});
+        return ctx.respondJson(.ok, .{ .state = try stateView(arena, sys, role) });
+    }
+
+    if (std.mem.eql(u8, path, "/api/rounds")) {
+        const Body = struct { group_count: ?usize = null };
+        const body = parseBody(Body, &ctx) catch |err| switch (err) {
+            // In permutation mode the count comes from the slots, so no body is fine.
+            error.EmptyBody => Body{},
+            else => return badRequest(&ctx, err),
+        };
         const n = sys.bgs.base.memberCount();
         if (n == 0) return ctx.respondError(.unprocessable_entity, "add some members first");
-        if (body.group_count == 0 or body.group_count > n) {
+        const group_count = if (sys.slots) |slots| blk: {
+            if (body.group_count) |gc| if (gc != slots.len) {
+                return ctx.respondError(.unprocessable_entity, "group_count must match the number of named groups");
+            };
+            if (slots.len > n) return ctx.respondError(.unprocessable_entity, "there are more named groups than members");
+            break :blk slots.len;
+        } else body.group_count orelse return ctx.respondError(.bad_request, "group_count is required");
+        if (group_count == 0 or group_count > n) {
             return ctx.respondError(.unprocessable_entity, "group_count must be between 1 and the number of members");
         }
-        var round = try sys.bgs.createBalancedGroups(body.group_count, app.prng.random());
+        var round = if (sys.slots != null)
+            try sys.bgs.createSlottedGroups(group_count, app.prng.random(), sys.slot_weight)
+        else
+            try sys.bgs.createBalancedGroups(group_count, app.prng.random());
         defer bg.freeRound(app.gpa, &round);
         try app.save();
-        log.info("created round {d}: {d} groups of {d} members", .{ sys.bgs.base.group_history.items.len, body.group_count, n });
+        log.info("created round {d}: {d} groups of {d} members", .{ sys.bgs.base.group_history.items.len, group_count, n });
         return ctx.respondJson(.created, .{
             .round = RoundView{ .groups = round.items },
             .state = try stateView(arena, sys, role),
@@ -635,6 +712,11 @@ fn handle(app: *App, req: *http.Server.Request, arena: Allocator) !void {
         const Body = struct { groups: []const []const []const u8, add_missing: bool = false };
         const body = parseBody(Body, &ctx) catch |err| return badRequest(&ctx, err);
         if (body.groups.len == 0) return ctx.respondError(.unprocessable_entity, "provide at least one group");
+        // Permutation mode: groups are positional, so an unused id is `[]`.
+        const positional = sys.slots != null;
+        if (sys.slots) |slots| if (body.groups.len > slots.len) {
+            return ctx.respondError(.unprocessable_entity, "more groups than named groups");
+        };
 
         // Normalise names, and check for empties/duplicates before mutating.
         var total: usize = 0;
@@ -643,7 +725,7 @@ fn handle(app: *App, req: *http.Server.Request, arena: Allocator) !void {
         var seen = std.StringHashMap(void).init(arena);
         var unknown: std.ArrayList([]const u8) = .empty;
         for (body.groups, 0..) |g, gi| {
-            if (g.len == 0) return ctx.respondError(.unprocessable_entity, "every group needs at least one name");
+            if (g.len == 0 and !positional) return ctx.respondError(.unprocessable_entity, "every group needs at least one name");
             const names = try arena.alloc([]const u8, g.len);
             for (g, 0..) |raw, ni| {
                 const name = validateName(raw) catch |err| return badRequest(&ctx, err);
@@ -657,6 +739,7 @@ fn handle(app: *App, req: *http.Server.Request, arena: Allocator) !void {
             }
             clean[gi] = names;
         }
+        if (total == 0) return ctx.respondError(.unprocessable_entity, "the round has nobody in it");
         if (unknown.items.len > 0 and !body.add_missing) {
             return ctx.respondJson(.unprocessable_entity, .{
                 .@"error" = "some names are not members yet",
@@ -667,7 +750,8 @@ fn handle(app: *App, req: *http.Server.Request, arena: Allocator) !void {
             return ctx.respondError(.unprocessable_entity, "too many members");
         }
         for (unknown.items) |name| try sys.bgs.addMember(name);
-        sys.bgs.recordManualRound(clean) catch |err| switch (err) {
+        const recorded = if (positional) sys.bgs.recordManualSlottedRound(clean) else sys.bgs.recordManualRound(clean);
+        recorded catch |err| switch (err) {
             // All three were ruled out above; anything else is a real failure.
             error.MemberNotFound, error.DuplicateMember, error.EmptyGroup => unreachable,
             else => return err,

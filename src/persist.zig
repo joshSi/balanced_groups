@@ -29,6 +29,11 @@
 //! }
 //! ```
 //!
+//! A system in group-id ("permutation") mode also has `"slots": ["Patio",
+//! "Kitchen", ...]`, the names of its group ids in order, and `"slot_weight"`.
+//! Both are optional (absent = classic mode), so older files still load and
+//! an older server reading a newer file just ignores them.
+//!
 //! `storeFromJson` also accepts version 2 (no `key_hash`/`created`) and
 //! version 1 (a single system at the top level, loaded with id
 //! `legacy_system_id`).
@@ -160,12 +165,45 @@ pub const NamedSystem = struct {
     /// Unix seconds when the system was created (0 when unknown).
     created: i64,
     bgs: BalancedGroupSystem,
+    /// Group-id mode: the name of each group id, in order (round group i sits
+    /// at `slots[i]`). Null in classic mode, where ids mean nothing.
+    slots: ?[][]u8 = null,
+    /// How much a member returning to a group id costs (see
+    /// `BalancedGroupSystem.createSlottedGroups`).
+    slot_weight: u32 = BalancedGroupSystem.default_slot_weight,
 
     pub fn deinit(self: *NamedSystem, gpa: Allocator) void {
         gpa.free(self.id);
         gpa.free(self.name);
         if (self.key_hash) |h| gpa.free(h);
+        freeSlots(gpa, self.slots);
         self.bgs.deinit();
+    }
+
+    /// Replace the group-id names (null leaves group-id mode). Takes a copy.
+    pub fn setSlots(self: *NamedSystem, gpa: Allocator, names: ?[]const []const u8) Allocator.Error!void {
+        var copy: ?[][]u8 = null;
+        if (names) |ns| {
+            const list = try gpa.alloc([]u8, ns.len);
+            var done: usize = 0;
+            errdefer {
+                for (list[0..done]) |s| gpa.free(s);
+                gpa.free(list);
+            }
+            for (ns) |s| {
+                list[done] = try gpa.dupe(u8, s);
+                done += 1;
+            }
+            copy = list;
+        }
+        freeSlots(gpa, self.slots);
+        self.slots = copy;
+    }
+
+    fn freeSlots(gpa: Allocator, slots: ?[][]u8) void {
+        const list = slots orelse return;
+        for (list) |s| gpa.free(s);
+        gpa.free(list);
     }
 
     /// Replace the passcode hash (null clears it). Takes a copy.
@@ -193,6 +231,8 @@ const SystemSnapshot = struct {
     members: []const []const u8,
     fam: []const u32,
     history: []const []const []const []const u8,
+    slots: ?[]const []const u8 = null,
+    slot_weight: u32 = BalancedGroupSystem.default_slot_weight,
 };
 
 /// Either file version; fields absent in the other version are null.
@@ -232,6 +272,9 @@ pub fn storeFromJson(gpa: Allocator, json: []const u8) StoreLoadError!Store {
                 }
                 const bgs = try fromSnapshot(gpa, .{ .members = s.members, .fam = s.fam, .history = s.history });
                 try appendSystem(gpa, &store, s.id, s.name, s.key_hash, s.created, bgs);
+                const added = &store.items[store.items.len - 1];
+                try added.setSlots(gpa, s.slots);
+                added.slot_weight = s.slot_weight;
             }
         },
         else => return error.UnsupportedVersion,
@@ -260,6 +303,8 @@ const JsonSystem = struct {
     members: []const []const u8,
     fam: []const u32,
     history: JsonHistory,
+    slots: ?[]const []const u8,
+    slot_weight: u32,
 };
 
 /// Serialise a store as version 2 JSON. Caller owns the result.
@@ -275,6 +320,8 @@ pub fn storeToJson(gpa: Allocator, systems: []const NamedSystem) Allocator.Error
             .members = @ptrCast(sys.bgs.base.members.items),
             .fam = sys.bgs.fam_matrix.items,
             .history = .{ .rounds = sys.bgs.base.group_history.items },
+            .slots = if (sys.slots) |s| @ptrCast(s) else null,
+            .slot_weight = sys.slot_weight,
         };
     }
     return std.json.Stringify.valueAlloc(gpa, .{ .version = store_version, .systems = views }, .{});
@@ -417,4 +464,29 @@ test "persist: store rejects duplicate system ids" {
         \\ {"id":"a","name":"B","members":[],"fam":[],"history":[]}]}
     ;
     try std.testing.expectError(error.DuplicateSystemId, storeFromJson(alloc, bad));
+}
+
+test "persist: group-id names and weight round-trip; absent means classic" {
+    const alloc = std.testing.allocator;
+    var store: Store = .empty;
+    defer deinitStore(alloc, &store);
+    try appendSystem(alloc, &store, "a", "A", null, 0, BalancedGroupSystem.init(alloc));
+    try appendSystem(alloc, &store, "b", "B", null, 0, BalancedGroupSystem.init(alloc));
+    try store.items[1].setSlots(alloc, &.{ "Patio", "Kitchen" });
+    store.items[1].slot_weight = 7;
+
+    const json = try storeToJson(alloc, store.items);
+    defer alloc.free(json);
+    var restored = try storeFromJson(alloc, json);
+    defer deinitStore(alloc, &restored);
+
+    try std.testing.expect(restored.items[0].slots == null);
+    try std.testing.expectEqual(BalancedGroupSystem.default_slot_weight, restored.items[0].slot_weight);
+    const slots = restored.items[1].slots.?;
+    try std.testing.expectEqual(@as(usize, 2), slots.len);
+    try std.testing.expectEqualStrings("Kitchen", slots[1]);
+    try std.testing.expectEqual(@as(u32, 7), restored.items[1].slot_weight);
+
+    try restored.items[1].setSlots(alloc, null);
+    try std.testing.expect(restored.items[1].slots == null);
 }

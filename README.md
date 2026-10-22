@@ -90,6 +90,27 @@ After placement, every pair in each group has its familiarity incremented by 2
 (matching the original Python convention of iterating over all ordered pairs
 `(i, j)` and `(j, i)` for each pair).
 
+### When group ids matter (`createSlottedGroups`)
+
+If "Group 1" is a fixed place (table 1, room A), members should also rotate
+through the ids. `createSlottedGroups(group_count, rand, slot_weight)` minimises
+
+```
+Σ familiarity within groups  +  slot_weight · Σ past visits of each member to their group's id
+```
+
+Visits are counted from history (`slotCounts`), so undo, manual rounds and
+removed members need no extra state. A repeat meeting adds 2, so
+`slot_weight = 1` treats one repeat meeting as twice as bad as one repeat
+visit; around 3 or more, rotation wins. The search is the same greedy fill
+and swap hill-climb with the slot term added, plus an exact relabelling step:
+because renumbering whole groups never changes who meets whom, the best
+numbering of a fixed partition is an assignment problem, solved with the
+Hungarian method (groups only take ids of the same size). For the pairs
+round-robin case, several valid matchings are tried and the best-numbered one
+kept. Ids are chosen one round at a time, so long runs can be slightly worse
+than an ideal planned rotation.
+
 ---
 
 ## Performance
@@ -262,12 +283,23 @@ server refuses to start rather than overwrite it.
 | POST   | `/api/systems/rename`  | `{ "id": "chess-club", "name": "Chess" }` | Rename; the id (and links using it) stay the same |
 | POST   | `/api/systems/delete`  | `{ "id": "chess-club" }` | Delete a system and everything in it (409 for the last one) |
 | POST   | `/api/systems/passcode` | `{ "id": "…", "passcode": "optional" }` | Set a new passcode (generated when omitted); returns it once. Owner or admin |
-| GET    | `/api/state`           |                     | `{ system: {id, name}, members, familiarity (n×n), history, rounds, can_edit, locked }` |
+| GET    | `/api/state`           |                     | `{ system: {id, name}, members, familiarity (n×n), history, rounds, can_edit, locked, slots, slot_weight, slot_visits }` |
 | POST   | `/api/members`         | `{ "name": "Eve" }` | Add a member (409 if it exists) |
 | POST   | `/api/members/remove`  | `{ "name": "Eve" }` | Remove a member and their matrix row/column |
-| POST   | `/api/rounds`          | `{ "group_count": 3 }` | Create a round; returns `{ round, state }` |
+| POST   | `/api/slots`           | `{ "slots": ["Patio","Kitchen","Den"], "slot_weight": 3 }` | Permutation mode: name the group ids (`slots: null` returns to classic mode; `slot_weight` optional, 0–100). Returns `{ state }` |
+| POST   | `/api/rounds`          | `{ "group_count": 3 }` | Create a round; returns `{ round, state }`. In permutation mode the body may be omitted |
 | POST   | `/api/rounds/manual`   | `{ "groups": [["Al","Bo"],["Cy"]], "add_missing": false }` | Record a round formed elsewhere (e.g. before the tool); 422 with `unknown` if names aren't members unless `add_missing` |
 | POST   | `/api/rounds/undo`     |                     | Revert the latest round (familiarity is subtracted) |
+
+**Permutation mode.** When the group ids mean something (tables, rooms),
+name them with `/api/slots`. Group `i` of every round is then at
+`slots[i]`, the group count is `slots.length`, and rounds use
+`createSlottedGroups`, so members also rotate through the ids.
+`slot_visits[m][i]` counts how often member `m` has been at id `i`. Ids are
+positional: renaming an id keeps its history, reordering does not move it.
+Manual rounds are positional too, so an id nobody used is an empty group `[]`.
+In classic mode `slots` and `slot_visits` are `null`. Both settings are saved
+with the system, and older state files load in classic mode.
 
 `/api/state`, `/api/members*` and `/api/rounds*` act on the system given by
 `?system=<id>` (404 if unknown), or on the first system when it is omitted.

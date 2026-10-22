@@ -296,3 +296,70 @@ test "BGS: stress — 200 members × 30 rounds, no memory leaks" {
 
     try std.testing.expectEqual(@as(usize, 30), bgs.base.group_history.items.len);
 }
+
+// ── Coverage: everyone meets everyone ────────────────────────────────────────
+
+/// Run `rounds` rounds over `n` members and return how many pairs never shared a group.
+fn unmetAfter(n: usize, group_count: usize, rounds: usize, seed: u64) !usize {
+    var bgs = bg.BalancedGroupSystem.init(alloc);
+    defer bgs.deinit();
+    var buf: [8]u8 = undefined;
+    for (0..n) |i| try bgs.addMember(try std.fmt.bufPrint(&buf, "m{d}", .{i}));
+    var prng = std.Random.DefaultPrng.init(seed);
+    for (0..rounds) |_| {
+        var round = try bgs.createBalancedGroups(group_count, prng.random());
+        bg.freeRound(alloc, &round);
+    }
+    var unmet: usize = 0;
+    for (0..n) |j| for (0..j) |i| {
+        if (bgs.getFam(i, j) == 0) unmet += 1;
+    };
+    return unmet;
+}
+
+test "BGS: 8 people in pairs all meet within 7 rounds" {
+    var failures: usize = 0;
+    for (0..300) |seed| {
+        if (try unmetAfter(8, 4, 7, seed) != 0) failures += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 0), failures);
+}
+
+test "BGS: 12 people in pairs all meet within 11 rounds" {
+    for (0..100) |seed| try std.testing.expectEqual(@as(usize, 0), try unmetAfter(12, 6, 11, seed));
+}
+
+test "BGS: group sizes never differ by more than one" {
+    var bgs = bg.BalancedGroupSystem.init(alloc);
+    defer bgs.deinit();
+    var buf: [8]u8 = undefined;
+    for (0..8) |i| try bgs.addMember(try std.fmt.bufPrint(&buf, "m{d}", .{i}));
+    var prng = std.Random.DefaultPrng.init(5);
+    for (0..12) |_| {
+        var round = try bgs.createBalancedGroups(4, prng.random());
+        defer bg.freeRound(alloc, &round);
+        for (round.items) |g| try std.testing.expectEqual(@as(usize, 2), g.items.len);
+    }
+}
+
+test "BGS: uneven counts tack leftovers onto groups, never an island" {
+    // 7 people / 3 groups -> 3,2,2; 9 / 4 -> 3,2,2,2; 11 / 5 -> 3,2,2,2,2
+    const cases = [_][2]usize{ .{ 7, 3 }, .{ 9, 4 }, .{ 11, 5 } };
+    for (cases) |c| {
+        var bgs = bg.BalancedGroupSystem.init(alloc);
+        defer bgs.deinit();
+        var buf: [8]u8 = undefined;
+        for (0..c[0]) |i| try bgs.addMember(try std.fmt.bufPrint(&buf, "m{d}", .{i}));
+        var prng = std.Random.DefaultPrng.init(11);
+        for (0..c[0]) |_| {
+            var round = try bgs.createBalancedGroups(c[1], prng.random());
+            defer bg.freeRound(alloc, &round);
+            for (round.items) |g| try std.testing.expect(g.items.len >= 2);
+        }
+        var unmet: usize = 0;
+        for (0..c[0]) |j| for (0..j) |i| {
+            if (bgs.getFam(i, j) == 0) unmet += 1;
+        };
+        std.debug.print("n={d} groups={d}: unmet after {d} rounds = {d}\n", .{ c[0], c[1], c[0], unmet });
+    }
+}
