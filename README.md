@@ -106,10 +106,19 @@ visit; around 3 or more, rotation wins. The search is the same greedy fill
 and swap hill-climb with the slot term added, plus an exact relabelling step:
 because renumbering whole groups never changes who meets whom, the best
 numbering of a fixed partition is an assignment problem, solved with the
-Hungarian method (groups only take ids of the same size). For the pairs
-round-robin case, several valid matchings are tried and the best-numbered one
-kept. Ids are chosen one round at a time, so long runs can be slightly worse
-than an ideal planned rotation.
+Hungarian method (groups only take ids of the same size).
+
+For pairs (round-robin), choosing one round at a time dead-ends: with 12
+people at 6 ids it nearly always left someone at one id twice by round 6.
+So the solver plans ahead with a bounded backtracking search. It looks for
+every round up to the point where everyone has had each id once more, with
+everyone at an id they have visited least and beside someone new, and with
+the rest of the round-robin still completable. Only the first planned round
+is used; the next call plans again from history. If no plan is found in
+budget, it falls back to one round at a time, and the round-robin result
+must then beat the general search on total cost, so a high `slot_weight`
+is honoured. With 12 people in 6 pairs, 6 rounds give everyone every id
+exactly once and no repeat meetings.
 
 ---
 

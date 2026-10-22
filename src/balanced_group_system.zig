@@ -419,6 +419,44 @@ pub const BalancedGroupSystem = struct {
         for (groups) |*g| try g.ensureTotalCapacity(alloc, 2);
         var partner: [64]u8 = undefined;
         var budget: usize = 200_000;
+
+        // Best case with group ids: every pair sits at an id both have visited
+        // least, so nobody comes back early and the round-robin stays intact.
+        // Choosing one round at a time can dead-end a few rounds later (with 12
+        // people at 6 ids, nearly always), so first try to plan every round up
+        // to when everyone has had each id once more; only this round is used.
+        if (slots) |sc| if (sc.weight > 0 and groups.len <= 64) {
+            var fresh: [64]u64 = @splat(0); // fresh[gi] = members for whom id gi is least visited
+            var horizon: usize = groups.len;
+            for (0..n) |m| {
+                const row = sc.counts[m * sc.group_count ..][0..sc.group_count];
+                const least = std.mem.min(u32, row);
+                var k: usize = 0;
+                for (row, 0..) |c, gi| if (c == least) {
+                    fresh[gi] |= @as(u64, 1) << @intCast(m);
+                    k += 1;
+                };
+                horizon = @min(horizon, k);
+            }
+            horizon = @min(horizon, d); // the round-robin has only d rounds left
+            const ids: u64 = if (groups.len == 64) ~@as(u64, 0) else (@as(u64, 1) << @intCast(groups.len)) - 1;
+            var seated: [64][2]u8 = undefined;
+            var plan: SeatPlan = .{ .full = all, .ids = ids, .first = &seated, .rand = rand, .budget = &budget };
+            for ([_]usize{ horizon, 1 }) |rows| {
+                budget = 200_000;
+                if (plan.seat(adj, fresh, rows, true, all, ids)) {
+                    for (groups, seated[0..groups.len]) |*g, pr| {
+                        g.items.len = 2;
+                        g.items[0] = pr[0];
+                        g.items[1] = pr[1];
+                    }
+                    return true;
+                }
+                if (rows == 1) break;
+            }
+            budget = 200_000;
+        };
+
         if (!matchAndExtend(adj, all, all, &partner, rand, &budget)) return false;
         pairsFromPartners(groups, partner[0..n]);
         const sc = slots orelse return true;
@@ -442,6 +480,70 @@ pub const BalancedGroupSystem = struct {
         for (groups, 0..) |*g, gi| @memcpy(g.items, &best[gi]);
         return true;
     }
+
+    /// Search for `rows` consecutive rounds of pairs in which everyone sits at
+    /// a fresh id (one they have visited least) with someone they have not
+    /// met, after which the round-robin must still be completable. The pairs
+    /// of the first round are written to `first[id]`.
+    const SeatPlan = struct {
+        full: u64,
+        ids: u64,
+        first: *[64][2]u8,
+        rand: std.Random,
+        budget: *usize,
+
+        fn seat(p: *SeatPlan, adj: [64]u64, fresh: [64]u64, rows: usize, top: bool, unseated: u64, free: u64) bool {
+            if (unseated == 0) {
+                if (rows > 1) return p.seat(adj, fresh, rows - 1, false, p.full, p.ids);
+                var m = p.full;
+                while (m != 0) : (m &= m - 1) {
+                    if (adj[@ctz(m)] != 0) break;
+                } else return true;
+                var inner: [64]u8 = undefined;
+                return matchAndExtend(adj, p.full, p.full, &inner, p.rand, p.budget);
+            }
+            if (p.budget.* == 0) return false;
+            p.budget.* -= 1;
+
+            // Everyone is seated this round, so branch on the first unseated person.
+            const v: u6 = @intCast(@ctz(unseated));
+            const v_bit = @as(u64, 1) << v;
+            var tables: [64]u8 = undefined;
+            var nt: usize = 0;
+            var f = free;
+            while (f != 0) : (f &= f - 1) {
+                const t = @ctz(f);
+                if (fresh[t] & v_bit != 0) {
+                    tables[nt] = @intCast(t);
+                    nt += 1;
+                }
+            }
+            p.rand.shuffle(u8, tables[0..nt]);
+            for (tables[0..nt]) |t| {
+                var cand: [64]u8 = undefined;
+                var nc: usize = 0;
+                var c = fresh[t] & unseated & adj[v] & ~v_bit;
+                while (c != 0) : (c &= c - 1) {
+                    cand[nc] = @intCast(@ctz(c));
+                    nc += 1;
+                }
+                p.rand.shuffle(u8, cand[0..nc]);
+                for (cand[0..nc]) |u| {
+                    const u_bit = @as(u64, 1) << @intCast(u);
+                    var next_adj = adj;
+                    next_adj[v] &= ~u_bit;
+                    next_adj[u] &= ~v_bit;
+                    var next_fresh = fresh;
+                    next_fresh[t] &= ~(v_bit | u_bit);
+                    if (top) p.first[t] = .{ v, u };
+                    const t_bit = @as(u64, 1) << @intCast(t);
+                    if (p.seat(next_adj, next_fresh, rows, top, unseated & ~(v_bit | u_bit), free & ~t_bit)) return true;
+                    if (p.budget.* == 0) return false;
+                }
+            }
+            return false;
+        }
+    };
 
     /// Fill `groups` (capacity ≥ 2 each) with the pairs in `partner`.
     fn pairsFromPartners(groups: []std.ArrayList(usize), partner: []const u8) void {
@@ -568,8 +670,14 @@ pub const BalancedGroupSystem = struct {
         // pairs never finishing the round-robin), so improve each attempt by
         // swapping members between groups and keep the best of a few restarts.
         const pairs_done = try self.roundRobinPairs(alloc, idx_groups, rand, slots);
-        const restarts: usize = if (pairs_done) 0 else if (n <= 64) 24 else 4;
+        // With group ids, the round-robin pick still has to beat the general
+        // search on total cost: it only avoids repeat meetings, and a high
+        // slot weight can make returning to a group the bigger cost.
+        const restarts: usize = if (pairs_done and slots == null) 0 else if (n <= 64) 24 else 4;
         var best_cost: u32 = std.math.maxInt(u32);
+        if (pairs_done) if (slots) |sc| {
+            best_cost = slotCostOf(idx_groups, sc); // every pair is new, so no meeting cost
+        };
         for (0..restarts) |_| {
             for (0..n) |i| indices[i] = i;
             rand.shuffle(usize, indices);
@@ -902,11 +1010,11 @@ test "BalancedGroupSystem createSlottedGroups still finishes the pair round-robi
         gs_mod.freeRound(allocator, &round);
     }
     for (bgs.fam_matrix.items) |v| try std.testing.expectEqual(@as(u32, 2), v);
-    // 7 rounds over 4 ids: 2 is ideal, but ids are chosen one round at a time
-    // after the round-robin's constraints, so allow one extra visit.
+    // 7 rounds over 4 ids: the first 4 rounds are planned together, so
+    // everyone visits every id once; the last 3 can't all be perfect.
     const counts = try bgs.slotCounts(allocator, 4);
     defer allocator.free(counts);
-    for (counts) |c| try std.testing.expect(c <= 3);
+    for (counts) |c| try std.testing.expect(c >= 1 and c <= 3);
 }
 
 test "BalancedGroupSystem slotCounts follows undo and removed members" {
@@ -946,4 +1054,26 @@ test "BalancedGroupSystem recordManualSlottedRound keeps empty ids in place" {
     // C sat at id 2, not id 1.
     try std.testing.expectEqualSlices(u32, &.{ 0, 0, 1 }, counts[2 * 3 ..][0..3]);
     try bgs.undoLastRound();
+}
+test "BalancedGroupSystem createSlottedGroups: 12 people in 6 pairs get every id once and never repeat a pair" {
+    // Reported case: choosing each round greedily dead-ended around round 5,
+    // leaving someone at one id twice and another never.
+    const allocator = std.testing.allocator;
+    for (0..10) |seed| {
+        var bgs = BalancedGroupSystem.init(allocator);
+        defer bgs.deinit();
+        for (0..12) |i| {
+            var buf: [8]u8 = undefined;
+            try bgs.addMember(try std.fmt.bufPrint(&buf, "m{d}", .{i}));
+        }
+        var prng = std.Random.DefaultPrng.init(seed);
+        for (0..6) |_| {
+            var round = try bgs.createSlottedGroups(6, prng.random(), BalancedGroupSystem.default_slot_weight);
+            gs_mod.freeRound(allocator, &round);
+        }
+        const counts = try bgs.slotCounts(allocator, 6);
+        defer allocator.free(counts);
+        for (counts) |c| try std.testing.expectEqual(@as(u32, 1), c);
+        for (bgs.fam_matrix.items) |v| try std.testing.expect(v <= 2);
+    }
 }
